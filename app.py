@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta
 import os
 import logging
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ class AppPlatformToLoki:
             "Authorization": f"Bearer {do_token}",
             "Content-Type": "application/json"
         }
+        self.last_logs = {}
     
     def get_app_logs(self, app_id, component_name, log_type="RUN"):
         """Fetch logs from DigitalOcean App Platform"""
@@ -59,6 +61,54 @@ class AppPlatformToLoki:
         
         return log_lines
     
+    def format_log_timestamp(self, log_line):
+        """
+        Extract and format timestamp from log line
+        Example: frontend-customer-production 2025-10-27T19:50:32.682366470Z Listening on...
+        Returns: (formatted_time, remaining_log)
+        """
+        
+        pattern = r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)'
+        match = re.search(pattern, log_line)
+        
+        if match:
+            timestamp_str = match.group(1)
+            try:
+                
+                dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                
+                formatted_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+                
+                
+                cleaned_line = re.sub(pattern, '', log_line).strip()
+                
+                return formatted_time, cleaned_line
+            except Exception as e:
+                logger.debug(f"Error parsing timestamp: {e}")
+                return None, log_line
+        
+        return None, log_line
+    
+    def deduplicate_logs(self, log_lines, app_id, component_name):
+        """
+        Remove duplicate logs that are exactly the same as the last batch
+        Returns: (unique_logs, is_duplicate_batch)
+        """
+        key = f"{app_id}:{component_name}"
+        
+        
+        current_log_hash = '\n'.join(log_lines)
+        
+        
+        if key in self.last_logs and self.last_logs[key] == current_log_hash:
+            logger.info(f"🔄 Skipping duplicate logs for {component_name} (exact same as last batch)")
+            return [], True
+        
+        
+        self.last_logs[key] = current_log_hash
+        
+        return log_lines, False
+    
     def format_for_loki(self, log_lines, app_id, component_name, app_name=""):
         """Format logs for Loki push API"""
         if not log_lines:
@@ -66,8 +116,17 @@ class AppPlatformToLoki:
         
         values = []
         for line in log_lines:
+            
+            formatted_time, cleaned_line = self.format_log_timestamp(line)
+            
+            
+            if formatted_time:
+                pretty_log = f"[{formatted_time}] {cleaned_line}"
+            else:
+                pretty_log = line
+            
             timestamp_ns = str(int(time.time() * 1e9))
-            values.append([timestamp_ns, line])
+            values.append([timestamp_ns, pretty_log])
         
         if not values:
             return None
@@ -124,6 +183,13 @@ class AppPlatformToLoki:
             log_lines = self.parse_log_lines(logs)
             
             if log_lines:
+                
+                unique_logs, is_duplicate = self.deduplicate_logs(log_lines, app_id, component_name)
+                
+                if is_duplicate:
+                    logger.info(f"⏭️  Skipped duplicate batch for {app_name or app_id}/{component_name}")
+                    return False
+                
                 logger.info(f"📝 Parsed {len(log_lines)} log lines")
                 formatted_logs = self.format_for_loki(log_lines, app_id, component_name, app_name)
                 
