@@ -1,8 +1,1 @@
 requests==2.31.0
-```
-
-### 3. `.gitignore`
-```
-__pycache__/
-*.pyc
-.env
