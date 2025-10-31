@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import os
 import logging
 import re
+import hashlib
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,7 +19,9 @@ class AppPlatformToLoki:
             "Authorization": f"Bearer {do_token}",
             "Content-Type": "application/json"
         }
-        self.last_logs = {}
+        
+        self.last_log_hashes = {}
+        self.last_log_count = {}
     
     def get_app_logs(self, app_id, component_name, log_type="RUN"):
         """Fetch logs from DigitalOcean App Platform"""
@@ -46,7 +49,6 @@ class AppPlatformToLoki:
         if not logs_data:
             return log_lines
         
-        
         live_url = logs_data.get("live_url")
         if live_url:
             try:
@@ -67,21 +69,15 @@ class AppPlatformToLoki:
         Example: frontend-customer-production 2025-10-27T19:50:32.682366470Z Listening on...
         Returns: (formatted_time, remaining_log)
         """
-        
         pattern = r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)'
         match = re.search(pattern, log_line)
         
         if match:
             timestamp_str = match.group(1)
             try:
-                
                 dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-                
                 formatted_time = dt.strftime('%Y-%m-%d %H:%M:%S')
-                
-                
                 cleaned_line = re.sub(pattern, '', log_line).strip()
-                
                 return formatted_time, cleaned_line
             except Exception as e:
                 logger.debug(f"Error parsing timestamp: {e}")
@@ -89,25 +85,55 @@ class AppPlatformToLoki:
         
         return None, log_line
     
-    def deduplicate_logs(self, log_lines, app_id, component_name):
+    def get_new_logs_only(self, log_lines, app_id, component_name):
         """
-        Remove duplicate logs that are exactly the same as the last batch
-        Returns: (unique_logs, is_duplicate_batch)
+        Get only NEW logs that haven't been sent before
+        Uses hash-based tracking of last N lines
         """
         key = f"{app_id}:{component_name}"
         
-        
-        current_log_hash = '\n'.join(log_lines)
-        
-        
-        if key in self.last_logs and self.last_logs[key] == current_log_hash:
-            logger.info(f"🔄 Skipping duplicate logs for {component_name} (exact same as last batch)")
-            return [], True
+        if not log_lines:
+            return []
         
         
-        self.last_logs[key] = current_log_hash
+        last_n = 50
+        recent_logs = log_lines[-last_n:] if len(log_lines) > last_n else log_lines
+        current_hash = hashlib.md5('\n'.join(recent_logs).encode()).hexdigest()
         
-        return log_lines, False
+        
+        if key not in self.last_log_hashes:
+            logger.info(f"🆕 First run for {component_name} - storing baseline ({len(log_lines)} lines)")
+            self.last_log_hashes[key] = current_hash
+            self.last_log_count[key] = len(log_lines)
+            return []  
+        
+        
+        if self.last_log_hashes[key] == current_hash and self.last_log_count[key] == len(log_lines):
+            logger.info(f"⏭️  No new logs for {component_name}")
+            return []
+        
+        
+        last_count = self.last_log_count[key]
+        new_logs = []
+        
+        if len(log_lines) > last_count:
+            
+            new_logs = log_lines[last_count:]
+            logger.info(f"📊 Found {len(new_logs)} new log lines (out of {len(log_lines)} total)")
+        elif len(log_lines) < last_count:
+            
+            new_logs = log_lines
+            logger.info(f"🔄 App restart detected - sending all {len(new_logs)} logs")
+        else:
+            
+            new_logs = log_lines[-last_n:]
+            logger.info(f"🔄 Logs changed - sending last {len(new_logs)} lines")
+        
+        
+        self.last_log_hashes[key] = current_hash
+        self.last_log_count[key] = len(log_lines)
+        
+        return new_logs
     
     def format_for_loki(self, log_lines, app_id, component_name, app_name=""):
         """Format logs for Loki push API"""
@@ -116,9 +142,7 @@ class AppPlatformToLoki:
         
         values = []
         for line in log_lines:
-            
             formatted_time, cleaned_line = self.format_log_timestamp(line)
-            
             
             if formatted_time:
                 pretty_log = f"[{formatted_time}] {cleaned_line}"
@@ -143,6 +167,17 @@ class AppPlatformToLoki:
         }
         
         return {"streams": [stream]}
+    
+    def batch_logs(self, log_lines, batch_size=1000):
+        """
+        Split log lines into batches
+        Returns: list of batches
+        """
+        batches = []
+        for i in range(0, len(log_lines), batch_size):
+            batch = log_lines[i:i + batch_size]
+            batches.append(batch)
+        return batches
     
     def push_to_loki(self, formatted_logs):
         """Push formatted logs to Loki"""
@@ -173,40 +208,63 @@ class AppPlatformToLoki:
                 logger.error(f"Response: {e.response.text}")
             return False
     
-    def forward_logs(self, app_id, component_name, app_name="", log_type="RUN"):
+    def forward_logs(self, app_id, component_name, app_name="", log_type="RUN", batch_size=1000):
         """Main method to fetch and forward logs"""
         logger.info(f"🔄 Fetching logs for {app_name or app_id}/{component_name}...")
         
         logs = self.get_app_logs(app_id, component_name, log_type=log_type)
         
         if logs:
-            log_lines = self.parse_log_lines(logs)
+            all_log_lines = self.parse_log_lines(logs)
             
-            if log_lines:
+            if all_log_lines:
+                logger.info(f"📋 Total logs from API: {len(all_log_lines)}")
                 
-                unique_logs, is_duplicate = self.deduplicate_logs(log_lines, app_id, component_name)
                 
-                if is_duplicate:
-                    logger.info(f"⏭️  Skipped duplicate batch for {app_name or app_id}/{component_name}")
+                new_logs = self.get_new_logs_only(all_log_lines, app_id, component_name)
+                
+                if not new_logs:
                     return False
                 
-                logger.info(f"📝 Parsed {len(log_lines)} log lines")
-                formatted_logs = self.format_for_loki(log_lines, app_id, component_name, app_name)
+                logger.info(f"📝 Processing {len(new_logs)} new log lines")
                 
-                if formatted_logs:
-                    logger.info("📤 Pushing logs to Loki...")
-                    return self.push_to_loki(formatted_logs)
+                
+                if len(new_logs) > batch_size:
+                    logger.info(f"📦 Splitting into batches of {batch_size} logs...")
+                    batches = self.batch_logs(new_logs, batch_size)
+                    
+                    success_count = 0
+                    for i, batch in enumerate(batches, 1):
+                        logger.info(f"📤 Pushing batch {i}/{len(batches)} ({len(batch)} logs)...")
+                        formatted_logs = self.format_for_loki(batch, app_id, component_name, app_name)
+                        
+                        if formatted_logs and self.push_to_loki(formatted_logs):
+                            success_count += 1
+                        
+                        
+                        if i < len(batches):
+                            time.sleep(0.5)
+                    
+                    logger.info(f"✅ Pushed {success_count}/{len(batches)} batches successfully")
+                    return success_count > 0
                 else:
-                    logger.warning("⚠️  No logs to format")
-                    return False
+                    
+                    formatted_logs = self.format_for_loki(new_logs, app_id, component_name, app_name)
+                    
+                    if formatted_logs:
+                        logger.info("📤 Pushing logs to Loki...")
+                        return self.push_to_loki(formatted_logs)
+                    else:
+                        logger.warning("⚠️  No logs to format")
+                        return False
             else:
-                logger.info(f"ℹ️  No new log lines found for {app_name or app_id}/{component_name}")
+                logger.info(f"ℹ️  No log lines found for {app_name or app_id}/{component_name}")
                 return False
         else:
             logger.error(f"❌ Failed to fetch logs for {app_name or app_id}/{component_name}")
             return False
     
-    def run_continuous_multi(self, apps_config, interval=60, log_type="RUN"):
+    def run_continuous_multi(self, apps_config, interval=60, log_type="RUN", batch_size=1000):
         """
         Run continuously, forwarding logs from multiple apps/components
         
@@ -218,6 +276,8 @@ class AppPlatformToLoki:
         """
         logger.info(f"🚀 Starting continuous log forwarding for {len(apps_config)} app(s)...")
         logger.info(f"⏱️  Interval: {interval}s")
+        logger.info(f"📦 Batch size: {batch_size} logs per request")
+        logger.info(f"📝 Note: First run will NOT send historical logs (baseline only)")
         
         for config in apps_config:
             logger.info(f"   📱 {config.get('app_name', 'Unknown')}: {config['app_id']}/{config['component_name']}")
@@ -234,7 +294,7 @@ class AppPlatformToLoki:
                     app_name = config.get('app_name', '')
                     
                     try:
-                        self.forward_logs(app_id, component_name, app_name, log_type)
+                        self.forward_logs(app_id, component_name, app_name, log_type, batch_size)
                     except Exception as e:
                         logger.error(f"❌ Error processing {app_name or app_id}/{component_name}: {e}")
                         continue
@@ -272,14 +332,8 @@ def parse_apps_config(apps_string):
 
 
 if __name__ == "__main__":
-    
     DO_TOKEN = os.getenv("DO_TOKEN")
-    
-    
-    
     APPS_CONFIG = os.getenv("APPS_CONFIG")
-    
-    
     APP_ID = os.getenv("APP_ID")
     COMPONENT_NAME = os.getenv("COMPONENT_NAME")
     
@@ -289,21 +343,18 @@ if __name__ == "__main__":
     
     INTERVAL = int(os.getenv("INTERVAL", "60"))
     LOG_TYPE = os.getenv("LOG_TYPE", "RUN")
-    
+    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))  
     
     if not DO_TOKEN or not LOKI_URL:
         logger.error("❌ Missing required environment variables: DO_TOKEN, LOKI_URL")
         exit(1)
     
-    
     apps_config = []
     
     if APPS_CONFIG:
-        
         apps_config = parse_apps_config(APPS_CONFIG)
         logger.info(f"✅ Multi-app mode: {len(apps_config)} app(s) configured")
     elif APP_ID and COMPONENT_NAME:
-        
         apps_config = [{
             'app_id': APP_ID,
             'component_name': COMPONENT_NAME,
@@ -317,7 +368,7 @@ if __name__ == "__main__":
     logger.info(f"📍 Loki URL: {LOKI_URL}")
     logger.info(f"⏱️  Interval: {INTERVAL}s")
     logger.info(f"📋 Log Type: {LOG_TYPE}")
-    
+    logger.info(f"📦 Batch Size: {BATCH_SIZE}")
     
     forwarder = AppPlatformToLoki(
         do_token=DO_TOKEN,
@@ -326,5 +377,4 @@ if __name__ == "__main__":
         loki_password=LOKI_PASSWORD
     )
     
-    
-    forwarder.run_continuous_multi(apps_config, interval=INTERVAL, log_type=LOG_TYPE)
+    forwarder.run_continuous_multi(apps_config, interval=INTERVAL, log_type=LOG_TYPE, batch_size=BATCH_SIZE)
